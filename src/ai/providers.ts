@@ -204,25 +204,82 @@ export async function trimPrompt(prompt: string, maxTokens: number) {
 export function createPrompt(template: string, variables: Record<string, string>): string {
   let prompt = template;
   for (const key in variables) {
-    prompt = prompt.replace(`{{${key}}}`, variables[key] ?? '');
+    prompt = prompt.replace(`{{${key}}`, variables[key] ?? '');
   }
   return prompt;
 }
 
 // Configurable text call; returns string. Adds JSON response MIME when requested.
+
+// REPLACEMENT: Raw Fetch Implementation
+
+// REPLACEMENT: Raw Fetch Implementation
 export async function callGeminiProConfigurable(
   prompt: string,
   opts?: { json?: boolean; schema?: object; tools?: Tool[] }
 ): Promise<string> {
-  const extra: GenExtra | undefined = opts?.json
-    ? { responseMimeType: 'application/json', ...(opts?.schema ? { responseSchema: opts.schema } : {}) }
-    : undefined;
-  const wrapped = await generateContentInternal(
-    { contents: [{ role: 'user', parts: [{ text: prompt }] }] },
-    { ...(extra || {}), ...(opts?.tools ? { tools: opts.tools } : {}) }
-  );
-  return await wrapped.response.text();
+  const apiKey = process.env.GEMINI_API_KEY;
+  const model = process.env.GEMINI_MODEL || 'models/gemini-2.5-flash';
+  const url = `https://generativelanguage.googleapis.com/v1beta/${model}:generateContent?key=${apiKey}`;
+
+  // Prepend JSON instructions if needed (since we disabled strict mode)
+  let finalPrompt = prompt;
+  if (opts?.json) {
+     finalPrompt = "You must return a valid JSON object. Do not include markdown formatting like ```json. \n\n" + prompt;
+  }
+
+  const requestBody: any = {
+    contents: [{
+      role: 'user',
+      parts: [{ text: finalPrompt }]
+    }],
+    generationConfig: {
+      temperature: 0.7,
+      maxOutputTokens: 8192
+    }
+  };
+
+  // Google Search Tool injection
+  if (opts?.tools && opts.tools.some(t => 'googleSearch' in t)) {
+    requestBody.tools = [{ googleSearch: {} }];
+  } else if (process.env.ENABLE_GEMINI_GOOGLE_SEARCH === 'true') {
+     // Force search if enabled globally and appropriate (though usually we want explicit control)
+  }
+
+  try {
+    console.error(`[RawFetch] STARTING REQUEST to ${model}`);
+    console.error(`[RawFetch] Prompt Length: ${finalPrompt.length}`);
+    
+    const response = await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(requestBody)
+    });
+
+    if (!response.ok) {
+      const errText = await response.text();
+      console.error(`[RawFetch] HTTP ERROR ${response.status}: ${errText}`);
+      // Allow fallback to empty string so the agent retries or moves on
+      return '';
+    }
+
+    const data = await response.json();
+    const text = data.candidates?.[0]?.content?.parts?.[0]?.text;
+    
+    if (!text) {
+        console.error('[RawFetch] Empty response content:', JSON.stringify(data));
+        return '';
+    }
+    
+    return text;
+
+  } catch (error) {
+    console.error('[RawFetch] Exception:', error);
+    return ''; 
+  }
 }
+
+
 
 // Add type export to align with deep-research.ts
 export type ResearchResultOutput = {

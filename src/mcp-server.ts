@@ -1,3 +1,5 @@
+import * as fs_node from 'node:fs';
+import * as path_node from 'node:path';
 import { config } from 'dotenv';
 import { resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -91,31 +93,38 @@ server.registerTool(
         breadth: breadth ?? 3,
         existingLearnings: existingLearnings,
         onProgress: (progress: ResearchProgress) => {
-          // Basic progress logging; MCP notifications can be added when client expects them
-          const depthPct = progress.totalDepth > 0 ? (progress.totalDepth - progress.currentDepth) / progress.totalDepth : 0;
-          const breadthPct = progress.totalBreadth > 0 ? (progress.totalBreadth - progress.currentBreadth) / progress.totalBreadth : 0;
-          const queriesPct = progress.totalQueries > 0 ? progress.completedQueries / progress.totalQueries : 0;
-          const overall = Math.round(((depthPct + breadthPct + queriesPct) / 3) * 100);
-          logger.info({ overall, progress }, 'Progress update');
+           // Simple progress log
+           const msg = `Researching: ${progress.currentQuery || '...'}`;
+           logger.info({ progress }, msg);
         }
       } as ResearchOptions);
 
-      logger.info({ query }, 'Research completed, generating report...');
-
-      // Generate final report
-      const report = await writeFinalReport({
-        prompt: query,
-        learnings: result.learnings,
-        visitedUrls: result.visitedUrls
-      });
-
-      logger.info({ query }, 'Report generated successfully');
+      logger.info({ query }, 'Research completed.');
+      
+      // CRITICAL FIX: Use the content directly from the research result
+      // The research() function now returns the full report in 'content' (if using our custom engine)
+      // or we read it from the file it saved.
+      
+      let reportContent = (result as any).content;
+      
+      if (!reportContent && result.reportPath) {
+          // Fallback: Read the file if content wasn't returned in memory
+          try {
+            reportContent = fs_node.readFileSync(result.reportPath, 'utf-8');
+          } catch (e) {
+            reportContent = "Error reading report file.";
+          }
+      }
+      
+      if (!reportContent) {
+          reportContent = "# Error: No report content generated.";
+      }
 
       const finalResult: MCPResearchResult = {
         content: [
           {
             type: "text",
-            text: report
+            text: `## 🚀 RESEARCH COMPLETE\n\n${reportContent.slice(0, 25000)}\n\n---\n**FULL REPORT:** ${result.reportPath}`
           }
         ],
         metadata: {
@@ -127,11 +136,11 @@ server.registerTool(
           }
         }
       };
-
-      // 4. Store result in cache
+      
+      // Store in cache
+      const cacheKey = hashKey({ query, depth, breadth, existingLearnings });
       deepResearchCache.set(cacheKey, finalResult);
-      logger.info({ query }, 'Stored result in cache');
-
+      
       return finalResult;
     } catch (error) {
       const errorMessage = error instanceof Error ? error.message : String(error);
