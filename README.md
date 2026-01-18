@@ -304,15 +304,123 @@ npx @modelcontextprotocol/inspector node --env-file .env.local dist/mcp-server.j
 * **Stateless calls**: The server derives behavior from env; keep flags in sync with your client profile.
 * **Latency**: Enable batching and reasonable `CONCURRENCY_LIMIT` to balance speed vs rate limits.
 
+## Deployment Modes
+
+The server supports two deployment modes:
+
+### Local Mode (stdio)
+
+For Claude Code, Gemini CLI, and other local MCP clients:
+
+```bash
+node --env-file .env.local dist/mcp-server.js
+```
+
+**Behavior:**
+- Small reports (≤50KB): Returned inline in the response
+- Large reports (>50KB): Uploaded to GCS, URL returned with download instructions
+
+### HTTP Mode (Cloud Run / Remote)
+
+For Codex and other remote MCP clients:
+
+```bash
+# Set environment variable
+export MCP_HTTP_MODE=true
+
+# Or deploy to Cloud Run
+gcloud run deploy deep-research-mcp \
+  --source . \
+  --region=us-central1 \
+  --allow-unauthenticated \
+  --set-env-vars="MCP_HTTP_MODE=true,GEMINI_API_KEY=xxx,MCP_API_KEY=xxx,GCS_BUCKET_NAME=xxx"
+```
+
+**Behavior:**
+- All reports uploaded to GCS
+- Response includes signed URL (7-day expiration) with curl download command
+- API key authentication via `x-api-key` header
+
+**Endpoints:**
+- `POST /mcp` - MCP protocol endpoint
+- `GET /health` - Health check
+- `GET /sse` - SSE transport (alternative to StreamableHTTP)
+
+## Google Cloud Storage Integration
+
+Large reports are automatically stored in GCS to avoid transport size limits.
+
+**Setup:**
+
+1. Create a GCS bucket:
+```bash
+gcloud storage buckets create gs://your-bucket-name --location=us-central1
+```
+
+2. Grant permissions (for Cloud Run):
+```bash
+# Get service account
+SA=$(gcloud run services describe deep-research-mcp --region=us-central1 --format="value(spec.template.spec.serviceAccountName)")
+
+# Grant storage permissions
+gcloud storage buckets add-iam-policy-binding gs://your-bucket-name \
+  --member="serviceAccount:$SA" \
+  --role="roles/storage.objectAdmin"
+
+# Grant URL signing permissions
+gcloud iam service-accounts add-iam-policy-binding $SA \
+  --member="serviceAccount:$SA" \
+  --role="roles/iam.serviceAccountTokenCreator"
+```
+
+3. Set environment variable:
+```bash
+export GCS_BUCKET_NAME=your-bucket-name
+```
+
+## Size-Based Auto-Switching
+
+The server automatically switches to URL mode when reports exceed 50KB:
+
+| Report Size | stdio Mode | HTTP Mode |
+|-------------|------------|-----------|
+| ≤ 50 KB | Inline content | GCS URL |
+| > 50 KB | GCS URL | GCS URL |
+
+This prevents token limit issues in Claude Code, Gemini CLI, and other clients.
+
 ## Configuration
 
-* `GEMINI_API_KEY` — required
-* `GEMINI_MODEL` — defaults to `gemini-2.5-flash`
-* `GEMINI_MAX_OUTPUT_TOKENS` — defaults to `65536`
-* `CONCURRENCY_LIMIT` — defaults to `5`
-* `ENABLE_GEMINI_GOOGLE_SEARCH` — enable Google Search Grounding tool
-* `ENABLE_GEMINI_CODE_EXECUTION` — enable code execution tool
-* `ENABLE_GEMINI_FUNCTIONS` — enable function calling
+### Required
+
+| Variable | Description |
+|----------|-------------|
+| `GEMINI_API_KEY` | Google Gemini API key |
+
+### Gemini Settings
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `GEMINI_MODEL` | `gemini-2.5-flash` | Gemini model to use |
+| `GEMINI_MAX_OUTPUT_TOKENS` | `65536` | Maximum output tokens |
+| `CONCURRENCY_LIMIT` | `5` | Concurrent API calls |
+| `ENABLE_GEMINI_GOOGLE_SEARCH` | `false` | Enable Google Search Grounding |
+| `ENABLE_GEMINI_CODE_EXECUTION` | `false` | Enable code execution tool |
+| `ENABLE_GEMINI_FUNCTIONS` | `false` | Enable function calling |
+
+### Server Settings
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `MCP_HTTP_MODE` | `false` | Enable HTTP transport (for Cloud Run) |
+| `MCP_API_KEY` | (none) | API key for HTTP authentication |
+| `PORT` | `8080` | HTTP server port |
+
+### Storage Settings
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `GCS_BUCKET_NAME` | (none) | GCS bucket for report storage |
 
 Optional providers (planned/behind flags): Exa/Tavily can be integrated later; Firecrawl is not required for the current pipeline.
 
