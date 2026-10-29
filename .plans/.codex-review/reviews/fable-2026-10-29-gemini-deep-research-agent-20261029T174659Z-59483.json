@@ -1,0 +1,81 @@
+{
+  "verdict": "REVISE",
+  "risk": "MEDIUM",
+  "summary": "The round-1 revisions largely hold up against the repo. The new design is a server.ts factory with no side effects plus an unconditional entry point. Config description doesn't throw. Logs move to stderr. Cancellation is wired through `extra.signal`. Errors return category codes. dist/ is backed up, and the plan defines the go-live moment and rollback. These fit the current code: mcp-server.ts reads env at module level (lines 34, 115, 356), the logger has no destination, and dist/ is gitignored, so it can't be restored from git.\n\nA few material problems remain.\n\n1. **The live acceptance run would use the wrong provider.** When the run happens, `.env.local` still says `RESEARCH_PROVIDER=openai`, because the plan flips it only after the run succeeds. dotenv only fills in variables that aren't already set, and the SDK's StdioClientTransport passes the child process only a short list of inherited variables. Unless the harness sets `RESEARCH_PROVIDER=gemini` itself, the run goes to the retired OpenAI path, which is a live OpenAI call the plan forbids, and fails the gate.\n2. **A new crash path.** The SDK's `notification()` throws \"Not connected\" once the transport has closed, and closing the transport doesn't abort `extra.signal`. Progress notifications sent without catching that error would become unhandled rejections and could kill the process.\n3. **Claude Code's timeout isn't tested.** The plan says the scripted ≥60-minute harness will show whether Claude Code's tool timeout survives a long run. A separate harness can't show that.\n4. **The plan contradicts itself on what's authorized.** Leftover wording forbids network commands, secret-file access and review. Yet it requires a paid live run, an in-place edit of `.env.local`, and reviews.\n\nThese fixes are small, and the overall approach is sound.",
+  "findings": [
+    {
+      "severity": "HIGH",
+      "title": "Live acceptance run would go to the OpenAI provider unless RESEARCH_PROVIDER is set explicitly in the child env",
+      "detail": "Verified:\n- The plan runs `node dist/mcp-server.js` with the key loaded from `.env.local`, and flips `.env.local` from openai to gemini only after the run passes.\n- The entry calls dotenv `config()` on `../.env.local` (mcp-server.ts:24). dotenv never overwrites a variable that is already present in process.env.\n- StdioClientTransport starts the child with `{...getDefaultEnvironment(), ...params.env}` (sdk client/stdio.js:69-71), so only a small default list of variables is inherited.\n\nResult: unless the harness passes `RESEARCH_PROVIDER=gemini` itself, `.env.local`'s `openai` wins. The run then hits the retired OpenAI Responses path, which is an explicitly forbidden live OpenAI call (with any OPENAI_API_KEY present in .env.local). The check that the selected agent is deep-research-preview-04-2026 fails only after that call. Nothing in the plan confirms the resolved provider before spending money.",
+      "recommendation": "In the live-run step:\n- Pass `RESEARCH_PROVIDER=gemini` in the child env. It isn't a secret, so the command line is fine.\n- Do not pass `GEMINI_DEEP_RESEARCH_AGENT`.\n- Before calling the tool, read `mcp://capabilities` or the startup diagnostics and confirm provider=gemini, agent=deep-research-preview-04-2026, and no problems. Abort without a tool call if any of these differ."
+    },
+    {
+      "severity": "MEDIUM",
+      "title": "Progress-notification forwarding can cause an unhandled rejection that crashes the server",
+      "detail": "Verified in SDK 1.17.2:\n- `extra.sendNotification` calls `this.notification()` (protocol.js:149). That is async and throws 'Not connected' once `_transport` is undefined (protocol.js:319-320).\n- `_onclose()` clears the transport but does not abort request-handler signals (protocol.js:98-110).\n- SSEServerTransport.send throws 'Not connected' after its response closes (sse.js:146).\n\nSo after a client disconnects (HTTP/SSE close, or a stdio peer going away), polling continues and every progress tick's notification promise rejects. The plan's 'callback exceptions must not strand an interaction' covers synchronous throws inside the agent client. It does not cover a fire-and-forget promise rejection in the tool handler's onProgress. On Node 20+, an unhandled rejection exits the process by default, which in HTTP mode kills every session.",
+      "recommendation": "Await `sendNotification` inside try/catch, or attach `.catch()`, and log at debug level. Never let it reject unhandled. Add an InMemoryTransport/handler test where `sendNotification` rejects: research continues, the result is returned or cached, and no unhandledRejection fires. Optionally stop forwarding after the first failure."
+    },
+    {
+      "severity": "MEDIUM",
+      "title": "The scripted live run cannot show how Claude Code's tool timeout behaves",
+      "detail": "The plan says the live acceptance run 'records whether Claude Code's tool timeout survives a multi-minute run'. But that run is a separate stdio client given a ≥60-minute deadline, before `.env.local` is flipped. Claude Code can't take part, because it would resolve `openai` from .env.local and the plan forbids client-config changes. So the first real Claude Code run happens only after go-live and is never monitored.\n\nThis is inferred, not tested: if Claude Code's timeout is shorter than a run and it sends notifications/cancelled, the new `extra.signal` wiring cancels the paid task. Each retry then pays $1–3 and gets no report. Mitigating evidence: earlier legacy and OpenAI runs through Claude Code took several minutes.",
+      "recommendation": "Remove the claim, or add an explicit, monitored step after the flip: one depth-1 run from Claude Code, with the interaction id, elapsed time and outcome recorded. If Claude Code cancels the run, roll back to gemini-legacy. Alternatively, check the effective MCP tool-timeout setting first, by key name only. Either way, state in the plan that this behavior is unverified until that step happens."
+    },
+    {
+      "severity": "MEDIUM",
+      "title": "The plan contradicts itself on what the implementation session may do",
+      "detail": "The assumptions still say 'No implementation, installs, network commands, secret file reads (gemini_keys.json, .env.local), or reviewer invocation. Review is skipped at Herbert's explicit direction'. The same plan requires:\n- a paid live network run;\n- loading the key from .env.local;\n- a `sed` edit of .env.local, which the brief says not to read;\n- an `npm run build` that overwrites dist/;\n- reviews, of which this is round 2.\n\nIt also records that .env.local was already inspected by equality checks. An implementer reading the plan literally gets conflicting authority on the riskiest steps.",
+      "recommendation": "Label the plan-authoring constraints as historical. Add one 'Implementation-session authorizations' list that names exactly what is allowed: one standard-tier depth-1 live run; reading .env.local only through the entry's dotenv, with no printing; one targeted single-line edit of .env.local; `npm run build` overwriting dist/ after backup. Everything else stays forbidden. Note that the Herbert approvals cited for these come from the session, not from this repo."
+    },
+    {
+      "severity": "LOW",
+      "title": "The .env.local edit lacks safeguards",
+      "detail": "`.env.local` holds secrets, is gitignored, and is not in the baseline backup set. A `sed -i` edit can silently match nothing, or misbehave because BSD sed on macOS needs `-i ''`. No check is defined to show that exactly one line changed.",
+      "recommendation": "Before editing, use grep -c to confirm exactly one `^RESEARCH_PROVIDER=openai$` line, without printing. Edit with `sed -i.bak` (BSD syntax) or an equivalent atomic replace that keeps file permissions. Afterwards, confirm exactly one `^RESEARCH_PROVIDER=gemini$` and that the line count is unchanged. Leave the .bak in place for Herbert, or remove it only after checking."
+    },
+    {
+      "severity": "LOW",
+      "title": "The 'credential-free' startup check still loads the real key from .env.local",
+      "detail": "Leaving GEMINI_API_KEY unset doesn't keep the key out: dotenv fills unset variables from repo-root .env.local. No tool call is made, so nothing leaks, but the check isn't credential-free as described. It also writes nothing that shows where the key came from.",
+      "recommendation": "Set `GEMINI_API_KEY=` (empty string) explicitly, which dotenv will not override, together with `RESEARCH_PROVIDER=not-a-provider`. Or describe the check accurately."
+    },
+    {
+      "severity": "LOW",
+      "title": "The live run tests a different key from the one production uses",
+      "detail": "Claude Code's config supplies GEMINI_API_KEY in the client env, and that takes precedence over .env.local. The live run uses .env.local's key, if one exists. They may be different keys, projects or billing tiers (paid or free, with retention of 55 days or 1 day), so agent access and quota could behave differently in production. The plan doesn't say whether .env.local contains GEMINI_API_KEY at all. If it doesn't, the run fails with missing_key.",
+      "recommendation": "Before the run, confirm by name only that .env.local has GEMINI_API_KEY. Optionally compare hashes of the two key values, without printing either, to record whether production uses the same key. If they differ, record this as a verification gap."
+    },
+    {
+      "severity": "LOW",
+      "title": "Implementation details that can quietly change existing behavior",
+      "detail": "Inferred from the code:\n- **HTTP cache.** HTTP mode calls `createServer()` for every request (mcp-server.ts:374). If the default cache is built inside the factory, HTTP caching silently stops working. It must stay one lazily created, process-wide cache.\n- **Logger options.** pino rejects `transport` combined with a destination stream. Only the pretty transport should get `options.destination: 2`.\n- **Import order.** Static imports from the entry still create logger.ts (LOG_LEVEL) and the OpenAI module-level settings before dotenv runs. Both are existing issues.\n- **Report location.** The live run writes deep_research_report_*.md to the child's cwd, which may be the repo root.\n- **Progress values.** MCP requires each progress value to increase; whole elapsed seconds can repeat.",
+      "recommendation": "- Keep one lazily created module-level cache and test that two `createServer()` instances share it.\n- Branch the logger options so a transport and a stream are never both set.\n- Optionally load server.js with a dynamic import after dotenv.\n- Run the live harness with cwd set to a scratch directory, and keep the harness outside tracked files.\n- Use a strictly increasing progress value, such as elapsed milliseconds or a tick counter."
+    }
+  ],
+  "required_changes": [
+    "Live acceptance step: pass `RESEARCH_PROVIDER=gemini` explicitly in the child-process env, since dotenv won't overwrite it and `.env.local` still says openai. Before any tool call, read the capabilities resource or diagnostics and confirm provider=gemini, agent=deep-research-preview-04-2026 and no config problems. Abort without calling the paid tool if any of these differ.",
+    "Forward progress notifications with error handling: await in try/catch or attach `.catch()`, so a closed transport ('Not connected') can never cause an unhandled rejection. Add a test where `sendNotification` rejects and research still finishes without an unhandled rejection.",
+    "Correct the Claude Code timeout claim. Either add an explicit, monitored first Claude Code run after the flip (record interaction id, elapsed time and outcome; roll back to gemini-legacy if Claude Code cancels), or state that Claude Code's timeout behavior is unverified until that run.",
+    "Resolve the conflicting authority text. Mark the plan-authoring prohibitions as historical, and list exactly what the implementation session is authorized to do: one standard-tier depth-1 live run; .env.local loaded only through dotenv, never printed; one guarded single-line `.env.local` edit; `npm run build` overwriting dist/ after backup."
+  ],
+  "verification_gaps": [
+    "Herbert's approval of the paid live run and the `.env.local` edit is asserted in the plan, but nothing in the repo shows it. The brief lists a live depth-1 run only as Claude's declared conclusion, and it forbids reading .env.local.",
+    "~/.claude.json, ~/tools/gemini-mcp-wrapper.js and .env.local are outside the allowed paths or are secret files, so I didn't read them. The launch path, the keys present, and the current `openai` value come from the plan's own account.",
+    "Whether .env.local contains GEMINI_API_KEY, and whether it matches the key in Claude Code's config, is unknown.",
+    "Claude Code's actual MCP tool timeout, and whether it sends notifications/cancelled or resets its timer on progress, is unknown and not tested by the planned harness.",
+    "The Interactions API request and response shapes, acceptance of the `store` field, the status vocabulary, the cancel endpoint, agent ids and pricing all rest on the brief and can't be checked offline.",
+    "I ran no commands. The baseline (npm test 5 passed/2 failed, `tsc --noEmit` exit 0, Node v24.21.0) was not reproduced.",
+    "The pino behaviors I relied on (stdout by default; transport and stream can't be combined) come from library knowledge, not from running it."
+  ],
+  "confidence": "HIGH",
+  "cfrMeta": {
+    "phase": "plan",
+    "inputFile": ".plans/2026-10-29-gemini-deep-research-agent.md",
+    "inputInRepo": true,
+    "inputHash": "67e458d77bd35b216208596a9cf635582f68e16858428bdc278d54a66ff26b5a",
+    "reviewer": "fable",
+    "reviewerModel": "claude-opus-5-5",
+    "reviewDirection": "codex-authored/fable-reviewed",
+    "reviewedAt": "2026-10-29T17:46:59.000Z"
+  }
+}

@@ -1,6 +1,6 @@
 {
   "name": "deep-research",
-  "version": "0.3.0",
+  "version": "0.5.0",
   "main": "dist/mcp-server.js",
   "type": "module",
   "scripts": {
@@ -11,7 +11,7 @@
     "build:watch": "tsc --watch",
     "serve": "node --env-file=.env.local dist/mcp-server.js",
     "docker": "tsx src/run.ts",
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "test": "tsx --test 'src/**/*.test.ts'"
   },
   "author": "",
   "license": "ISC",
@@ -31,10 +31,11 @@
     "typescript": "^5.9.2"
   },
   "dependencies": {
+    "@azure/identity": "^4.13.0",
+    "@azure/storage-blob": "^12.30.0",
     "@crawlee/core": "^3.14.1",
     "@crawlee/memory-storage": "^3.14.1",
     "@crawlee/types": "^3.14.1",
-    "@google-cloud/storage": "^7.18.0",
     "@google/genai": "^1.13.0",
     "@modelcontextprotocol/sdk": "^1.17.2",
     "@tavily/core": "^0.5.10",

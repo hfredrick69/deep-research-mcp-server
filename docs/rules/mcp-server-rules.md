@@ -100,6 +100,7 @@ These rules align `src/mcp-server.ts` with @modelcontextprotocol/sdk best practi
 - For progress updates:
   - Keep progress logging server-side (`stderr`).
   - If a client needs live progress, prefer exposing a status resource (e.g., `status://{taskId}`) that clients can poll. Avoid custom ad-hoc notifications unless you control both ends.
+  - Update (2026-10-29): `deepResearch.run` emits standard MCP `notifications/progress` when the request carries a `progressToken` (`_meta.progressToken`); without one, progress stays in the server log. See `src/server.ts`.
 
 ## Error Handling
 - Catch errors and return a clear text message in `content`. Example:

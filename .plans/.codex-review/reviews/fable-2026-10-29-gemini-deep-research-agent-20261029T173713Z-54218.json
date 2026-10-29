@@ -1,0 +1,86 @@
+{
+  "verdict": "REVISE",
+  "risk": "MEDIUM",
+  "summary": "The plan is careful and mostly sound. It stays within scope (no SDK or package changes, existing work kept, no secret reads). It is strong on lifecycle: bounded timeouts, no automatic retry of POST creation, a single cancel, and the last model_output step only. Tests come before code. Four material gaps need fixing before implementation. (1) Startup and dotenv loading would be gated on an argv/import.meta.url check. That check is fragile and ignores the real launcher, `~/tools/gemini-mcp-wrapper.js` (named in GEMINI_RESEARCH_GUIDE.md). If it misfires, the server silently never starts, and none of the planned checks would catch it. (2) The plan never establishes what RESEARCH_PROVIDER the live client actually resolves to. Today every value other than 'openai' runs the legacy loop. The plan rejects unknown values and makes 'gemini' mean the paid agent, so the live tool could stop working, switch silently to the paid agent, or not change at all. (3) Verification runs `npm run build`, which overwrites dist/. dist/ is the artifact the server runs from (it matches the current working tree), so the paid default would go live before the deferred live test, contradicting the plan's \"no deployment\" claim. (4) The same resolver that rejects bad config would also build the tool description, capabilities, and startup logs. A bad env value could then crash startup instead of returning the promised safe error. Smaller items: client cancellation is not passed through to cancel the paid run, logs go to stdout on the stdio transport, and the baseline and rollback method is unspecified.",
+  "findings": [
+    {
+      "severity": "HIGH",
+      "title": "Startup gating via argv/import.meta.url ignores the real launcher and could silently stop the server from starting",
+      "detail": "Verified: GEMINI_RESEARCH_GUIDE.md:10 says the Claude Code integration runs through `~/tools/gemini-mcp-wrapper.js` (key rotation and model selection). The plan never inspects it. The Dockerfile, README, and package.json `main` all use dist/mcp-server.js. The plan gates dotenv loading, the startup log, and transport startup on a direct-execution check. That check is false if the wrapper imports the module instead of spawning it. It is also false if paths differ by a symlink (on macOS, /var vs /private/var), if the entry is launched without its extension, or if a loader rewrites argv. In any of those cases the MCP server never connects and gives no caller-visible error. The deterministic checks explicitly exclude starting the server, so nothing would catch this. Related hazard (verified): mcp-server.ts reads AZURE_STORAGE_ACCOUNT_NAME (line 34), PROVIDER_CACHE_TTL_MS (line 115) and MCP_HTTP_MODE (line 356) at module level. ESM static imports run before the entry file's body, which is why openai-deep-research.ts already reads its OPENAI_* settings before dotenv runs (an existing bug). Any refactor that moves code into an imported module must not read env at module top level.",
+      "recommendation": "Preferred: move createServer, apiKeyAuth, and the injectable dependencies into a new module with no side effects that reads env at call time. Keep src/mcp-server.ts as the entry point that always loads dotenv first and then starts the server. Tests import the new module; the entry stays unconditional. If detection is kept instead: inspect how the wrapper launches the server, compare realpaths, and add a credential-free stdio startup check (initialize plus tools/list, no tool call) for both `tsx src/mcp-server.ts` and the built entry."
+    },
+    {
+      "severity": "HIGH",
+      "title": "Live RESEARCH_PROVIDER value and launch path are unknown, so the effect on the live tool is unpredictable",
+      "detail": "Verified: in the current code (deep-research.ts:32-36) any value other than 'openai' runs the legacy loop. The plan makes unknown names a hard error and changes 'gemini' from the cheap legacy flash loop to the $1–7 agent. The wrapper 'handles model selection' between gemini-2.5-flash and gemini-3-pro-preview, which are legacy-only settings, so the live tool may depend on legacy routing through some RESEARCH_PROVIDER value. The brief only says client configs don't set it; the wrapper and .env.local (which the plan correctly won't read) might. Depending on that value, the change either does nothing ('openai'), silently moves Herbert to the paid agent ('gemini'), or breaks the tool (any other value that used to fall through to legacy).",
+      "recommendation": "Before editing, find out how the live client launches the server and what RESEARCH_PROVIDER it ends up with, without exposing secret values: ask Herbert, or inspect key names only and never print values. Record the expected live effect in the plan and get Herbert's acknowledgment of the paid go-live. Decide explicitly whether any existing value needs an alias rather than a rejection."
+    },
+    {
+      "severity": "MEDIUM",
+      "title": "`npm run build` replaces the artifact the server runs from; the 'no deployment' claim is inaccurate",
+      "detail": "Verified: dist/ exists and matches the current working tree (dist/mcp-server.js:23 has the 'openai' default), and every documented launch path runs dist/mcp-server.js. Running `npm run build` during verification changes what Herbert's client runs on its next restart. That switches the default to the paid, never-live-tested agent before the deferred live acceptance. If the wrapper runs from src through tsx instead, editing src alone has the same effect.",
+      "recommendation": "For build verification, compile to a scratch output directory (`./node_modules/.bin/tsc --outDir <scratch>`) instead of dist/, or get Herbert's explicit OK before overwriting dist/. Name the go-live moment relative to the live test. Document rollback: RESEARCH_PROVIDER=gemini-legacy plus a restart, or restoring the previous dist/."
+    },
+    {
+      "severity": "MEDIUM",
+      "title": "A resolver that throws on bad config would run during server construction and startup",
+      "detail": "The plan both rejects unknown provider names and malformed GEMINI_DR_* values, and shares that resolution with 'startup diagnostics, tool description, and capabilities'. The tool description is built inside createServer (mcp-server.ts:141), and the startup log runs at module top level. With a throwing resolver, a typo in env would crash the stdio server before connect, or make every HTTP /mcp request return a 500 from createServer. That contradicts the plan's 'stable safe error' contract, which it only guarantees inside the tool's error boundary.",
+      "recommendation": "Add a non-throwing describe/diagnose function, for example one returning {provider | 'invalid', agent | 'invalid'}, for the description, capabilities, and startup log. Only the execution path may throw, and only inside the tool handler's try/catch. Add a test showing that an invalid provider or poll value still lets createServer, tools/list, and capabilities succeed, while the tool call returns the generic error envelope."
+    },
+    {
+      "severity": "MEDIUM",
+      "title": "Client cancellation never cancels the paid interaction",
+      "detail": "Verified: in MCP SDK 1.17.2 the tool handler receives `extra.signal`, which aborts on notifications/cancelled (protocol.js:22-23, 146). The SDK's default request timeout is 60s (protocol.d.ts:32). Under the plan, a user interrupt or client timeout leaves a $1–7 task running for up to 60 minutes. A retry then creates a second paid task, because the cache only holds completed results. The plan already builds abort handling and a single cancel, so wiring an external signal in is cheap. The plan puts 'disconnect propagation' out of scope.",
+      "recommendation": "Optional but strongly advised: accept an optional AbortSignal in ResearchOptions (an internal field, not part of the MCP schema) and in the agent client. Pass `extra.signal` from the tool handler, and treat an abort as abandonment that sends the cancel once. Consider de-duplicating in-flight runs by cache key."
+    },
+    {
+      "severity": "MEDIUM",
+      "title": "Logs go to stdout on the stdio transport; the new default sends more of them",
+      "detail": "logger.ts creates pino with no destination, and pino writes to stdout by default (inferred from library defaults, not run). Repo rules (docs/rules/mcp-server-rules.md:18,101,110) require server and progress logs on stderr. The tool handler's onProgress logs through `logger.info` (mcp-server.ts:174). The new engine polls every 10s for up to 60 minutes, so these JSON lines mix into the stdio JSON-RPC channel for the whole run. The plan sends only new client logs to stderr and defers logger cleanup.",
+      "recommendation": "Send all logs this change adds or touches on the MCP path to stderr (for example, pino destination fd 2), or explicitly check stdout cleanliness during the live test. At minimum, add no new stdout logging calls on the stdio path."
+    },
+    {
+      "severity": "LOW",
+      "title": "A fully generic caller error hides actionable, non-secret information",
+      "detail": "Replacing raw error forwarding with one generic message is right for upstream text. But for a timed-out or failed paid run, the caller learns nothing: not the category (missing key, quota, timeout, unsupported state), and not the interaction id needed to recover the stored report within the retention window.",
+      "recommendation": "Include a stable category code from an allowlist and, when known, the interaction id in the caller-visible text. Keep upstream messages in sanitized logs only."
+    },
+    {
+      "severity": "LOW",
+      "title": "Baseline and rollback method unspecified for uncommitted work",
+      "detail": "src/deep-research.ts and src/mcp-server.ts contain uncommitted June 2026 work, and HEAD is January 2026. The plan forbids stash, reset, and clean, so git cannot restore the pre-change state. 'Capture a scoped baseline' has no defined method.",
+      "recommendation": "Before the first edit, copy every pre-existing file the change will touch (deep-research.ts, mcp-server.ts, .env.example, CHANGELOG.md) to a scratch directory outside the repo and record their hashes. Rollback diffs against those copies."
+    },
+    {
+      "severity": "LOW",
+      "title": "Strict handling of an unverified response shape can fail every default call",
+      "detail": "The steps[]/model_output structure, acceptance of the `store` field, and the status vocabulary all come from the brief. Rejecting unknown statuses and malformed shapes is correct and fails safely. But one mismatch in the completed payload would fail every default run after it has already been billed.",
+      "recommendation": "Make the live test a condition of go-live (see the dist/ finding). On any extraction or protocol failure after a completed status, log the interaction id so the stored report can be recovered."
+    }
+  ],
+  "required_changes": [
+    "Replace the argv/import.meta.url startup gating with a factory module that has no side effects and reads env at call time, plus an entry point (src/mcp-server.ts) that always loads dotenv first. If detection is kept instead: inspect the wrapper's launch mechanism, compare realpaths, and add a credential-free stdio initialize/tools/list startup check for both the tsx and built entries.",
+    "Before implementation, find out without exposing secret values how the live client and `~/tools/gemini-mcp-wrapper.js` launch the server and what RESEARCH_PROVIDER they resolve to. Document the expected live effect of re-pointing 'gemini' and rejecting unknown names, and get Herbert's acknowledgment of the paid-default go-live.",
+    "Don't overwrite dist/ (the artifact the server runs from) during verification without explicit approval. Compile to a scratch outDir for the build check, and define the go-live moment and rollback relative to the deferred live test.",
+    "Use a non-throwing resolution path for the tool description, capabilities, and startup diagnostics built in createServer. Only tool execution may throw, inside the error boundary. Add a test that invalid provider or timing env still lets the server start and list tools."
+  ],
+  "verification_gaps": [
+    "`~/tools/gemini-mcp-wrapper.js` is outside the authorized directories and was not read, so whether it spawns or imports the server, and which env it sets, is unknown.",
+    ".env.local and gemini_keys.json were deliberately not read; the effective RESEARCH_PROVIDER and GEMINI_DR_* values in the live environment are unknown.",
+    "No commands were run. The baseline in the packet (npm test 5 passed/2 failed, tsc --noEmit exit 0, Node v24.21.0) was not reproduced.",
+    "The Interactions API request and response shape, the `store` field, status vocabulary, agent ids, and pricing cannot be checked offline; all rest on the brief.",
+    "Pino's stdout default comes from knowledge of the library, not from running it; whether Claude Code tolerates non-JSON-RPC stdout lines was not tested.",
+    "The live client's timeout for MCP tool calls (whether it covers 20–60 minute runs) is unknown."
+  ],
+  "confidence": "MEDIUM",
+  "cfrMeta": {
+    "phase": "plan",
+    "inputFile": ".plans/2026-10-29-gemini-deep-research-agent.md",
+    "inputInRepo": true,
+    "inputHash": "5657e1ce42b5693d8f6e4208f5e802277dd7b727650801812564312ddcbd7546",
+    "reviewer": "fable",
+    "reviewerModel": "claude-opus-5-5",
+    "reviewDirection": "codex-authored/fable-reviewed",
+    "reviewedAt": "2026-10-29T17:37:13.000Z"
+  }
+}

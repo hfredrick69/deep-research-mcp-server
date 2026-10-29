@@ -2,6 +2,65 @@
 
 All notable changes to the Deep Research MCP Server are documented in this file.
 
+## [Unreleased]
+
+### Changed
+
+- **Default research engine is now Google's Deep Research agent** (Gemini Interactions API)
+  - `depth 1-2` selects `deep-research-preview-04-2026`; `depth >= 3` selects
+    `deep-research-max-preview-04-2026`. Override with `GEMINI_DEEP_RESEARCH_AGENT`.
+  - Background interactions polled every `GEMINI_DR_POLL_INTERVAL_MS` (5-10 s, default 10 s)
+    up to `GEMINI_DR_TIMEOUT_MS` (default and maximum 60 min); the interaction is cancelled
+    server-side on timeout or client abort.
+  - Cited source URLs are returned in `visitedUrls`; the report is written to
+    `deep_research_report_<timestamp>.md` as before.
+  - Requires `GEMINI_API_KEY`. Each run is billed per task (standard tier roughly $1-3,
+    max tier roughly $3-7).
+- **`RESEARCH_PROVIDER` values**: `gemini` (default when unset), `gemini-legacy` (the previous
+  in-process Gemini Pro + Google Search loop, formerly selected by `gemini`), `openai`.
+  An unrecognised value makes every tool call return an `invalid_config` error.
+- **MCP contract unchanged**: tool name `deepResearch.run`, input schema, inline/URL result
+  text and `metadata` shape are the same. Failures are returned as a text envelope
+  `Deep research failed. Category: <category>. [Interaction id: <id>.] Details are in the
+  server log.` with `metadata.errorCategory` (and `metadata.interactionId` when known);
+  upstream error text is logged, never returned to the client. Failures are not cached.
+- Standard `notifications/progress` are now emitted when the client supplies a
+  `progressToken`; without a token nothing is sent. Forwarding stops after the first failed
+  send.
+- Logs go to stderr only (stdout carries stdio JSON-RPC) through a synchronous pino
+  destination so the last lines survive a crash. `LOG_PRETTY=true` keeps pino-pretty.
+- The `mcp://capabilities` resource now reports `provider`, `agent`, `pollIntervalMs`,
+  `timeoutMs`, `legacyFlagsActive` and `configProblems`.
+- Server construction moved to `src/server.ts` (`createServer(deps)`) so it is testable
+  without a transport; `src/mcp-server.ts` is the transport entry point only.
+
+### Deprecated
+
+- `RESEARCH_PROVIDER=openai`: OpenAI has retired the `o3-deep-research` and
+  `o4-mini-deep-research` models. The path is kept for accounts that still have access and
+  is otherwise expected to fail with an `upstream_failed` error.
+
+### Known limitations
+
+- Interactions that enter `requires_action` or `requires_continuation` are cancelled and
+  reported as `unsupported_state` errors; the server does not drive interactive
+  clarification or continuation rounds. `failed`, `cancelled` and `incomplete` end as
+  `upstream_failed`.
+- **Deployment warning**: a remote deployment (for example the Cloud Run instance) that
+  leaves `RESEARCH_PROVIDER` unset will switch from OpenAI to the paid Google agent on its
+  next redeploy. Set the provider explicitly in every deployed environment.
+
+## [0.5.0] - 2026-06-12
+
+### Changed
+
+- **Default research engine is now OpenAI Deep Research** (ChatGPT Deep Research via the Responses API)
+  - `depth >= 3` selects `o3-deep-research`; lower depth uses `o4-mini-deep-research`
+  - Override model with `OPENAI_DEEP_RESEARCH_MODEL`; requires `OPENAI_API_KEY`
+  - Background mode with polling (`OPENAI_DR_POLL_INTERVAL_MS`, default 15s; `OPENAI_DR_TIMEOUT_MS`, default 45 min)
+  - Cited source URLs returned in `visitedUrls` metadata
+- Legacy Gemini engine retained behind `RESEARCH_PROVIDER=gemini` (loaded lazily so the server starts without a Gemini key)
+
 ## [0.4.0] - 2026-01-18
 
 ### Added

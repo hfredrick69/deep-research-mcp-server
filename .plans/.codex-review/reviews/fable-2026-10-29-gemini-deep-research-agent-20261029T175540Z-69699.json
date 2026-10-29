@@ -1,0 +1,73 @@
+{
+  "verdict": "REVISE",
+  "risk": "MEDIUM",
+  "summary": "This is round 3. All eight round-2 findings are reflected in the plan text, and I checked the claims they rest on against the repo:\n- The tool is registered as `deepResearch.run` (mcp-server.ts:138).\n- HTTP mode calls `createServer()` for each request (:374).\n- The entry runs dotenv on `../.env.local` (:24).\n- In SDK 1.17.2, `notification()` throws \"Not connected\", and `_onclose` does not abort request signals (protocol.js:98-110, 317-320).\n- `StdioClientTransport` passes the child only the default environment plus `params.env` (client/stdio.js:69-71).\n- dotenv 16.6.1 never overwrites a variable that is already set, including an empty string, and it is quiet by default (main.js:215, 350).\n- In JSON-response mode, the HTTP transport silently drops tool notifications.\n- tsconfig (ES2022/NodeNext, ESM) allows the planned top-level dynamic import.\n\nThe design is sound and the risks are well bounded. Two gaps remain, both about authority and sequencing; each needs a one- or two-line fix:\n1. **The verification steps go beyond the plan's own authorization list.** That list says everything not listed is forbidden. Yet the steps ask the session to hash secret key values from `.env.local` and `~/.claude.json`, and they add a second paid run (the \"First Claude Code run\") without saying who triggers it.\n2. **There is no commit policy, and a commit would hit a hidden dependency.** The tracked `src/deep-research.ts` already imports the untracked `src/ai/openai-deep-research.ts`. Committing this change would therefore either sweep in that leftover work (which the plan forbids without Herbert's permission) or leave a commit that doesn't build.\n\nNeither needs another full review round. Once both are fixed in the text, Codex can proceed. The other findings are optional hardening.",
+  "findings": [
+    {
+      "severity": "MEDIUM",
+      "title": "Verification steps go beyond the plan's own exhaustive authorization list (reading secret values, a second paid run)",
+      "detail": "Verified in the plan text. Authorization item 2 says the session \"never opens, prints, or diffs\" `.env.local`; the only checks it allows are equality/count greps on the `RESEARCH_PROVIDER` line and checks that key names exist. The list ends with \"everything not listed stays forbidden\". However:\n- The \"Key provenance gap\" step tells the session to compare the `GEMINI_API_KEY` values in `.env.local` and `~/.claude.json` using sha256 digests. Any digest script has to read both secret values into memory. Reading a key value from `~/.claude.json` is also not authorized: the plan's own launch-path verification says \"key names only, no values\". The fallback (\"if the tooling refuses... record a gap\") hands the decision to whatever tooling happens to allow it, not to the authorization list.\n- The \"First Claude Code run\" is a second paid run (about $1–3). Authorization item 1 covers exactly one run. The plan calls this run a \"follow-up\" and \"not part of this session's acceptance\", but never says whether Herbert or the implementing agent starts it, or whether the agent may write `.plans/DECISIONS.md` for it.\nRound 2 finding 4 was about exactly this kind of contradiction, so an implementer reading literally would again get conflicting authority on secret access and spending.",
+      "recommendation": "Pick one of these for the key comparison:\n- add it as an explicit authorization item, limited to an in-memory digest whose only output is same/different, if Herbert actually granted that; or\n- drop it and record \"production key not compared\" as a fixed verification gap.\n\nFor the First Claude Code run, state that Herbert starts it, or that it needs his separate approval. Also state that the implementing session does not start it."
+    },
+    {
+      "severity": "MEDIUM",
+      "title": "No commit scope is defined, and committing the change would hit leftover untracked work",
+      "detail": "Verified: `src/ai/openai-deep-research.ts` is not in `.git/index`, so it is untracked. The working-tree `src/deep-research.ts` is tracked, modified, and statically imports `./ai/openai-deep-research.js` (deep-research.ts:3). The plan says to \"never... sweep [backlog] into a commit... without Herbert's permission\", and authorization 5 refers to a security review \"before commit\", so a commit is implied. But the plan never says what gets committed.\n\nAny commit of the new `src/deep-research.ts` or `src/mcp-server.ts` would include the June changes in those files. Unless the untracked OpenAI module and its test are committed too, the commit would not build or type-check. Partial staging can't avoid this, because the new dispatch code itself keeps the OpenAI import.",
+      "recommendation": "State the commit policy explicitly. Either:\n- (a) make no commit in this session and leave the working tree for Herbert, listing the files this task touched; or\n- (b) get Herbert's explicit permission to first commit the June leftover work as its own commit, and only then commit this change on top.\n\nEither way, check that the committed tree builds on its own, for example with `git stash -k` replaced by a scratch worktree, or simply with option (a)."
+    },
+    {
+      "severity": "LOW",
+      "title": "Live-run harness: deadline margin, executor timeout, and no-retry rule",
+      "detail": "Inferred:\n- **Deadline margin.** The harness uses a client deadline of \"≥ 60 minutes\", and the server's `GEMINI_DR_TIMEOUT_MS` default is also exactly 3,600,000 ms. In SDK 1.17.2, a client request timeout calls `cancel()`, which sends `notifications/cancelled` (protocol.js:270-283, 305-307). With equal deadlines, the client can time out first. The server's new `extra.signal` handling would then cancel the paid task, and the server's own timeout/error envelope would never arrive.\n- **Executor timeout.** A run of 20–60 minutes may also exceed the executor's per-command timeout. If the harness is killed, the child loses stdin but keeps polling, and the report lands in the scratch working directory. The plan says \"if this run fails... report\", but it never says outright that an interrupted harness must not be re-run.",
+      "recommendation": "- Set the harness client timeout to the server deadline plus a margin, for example 70 minutes.\n- Run the harness detached, with stdout/stderr logs in scratch, and poll its status.\n- State explicitly that an interrupted or ambiguous run is never retried without Herbert's re-authorization.\n- Recover from the report file in scratch, or from the interaction id in the stderr log."
+    },
+    {
+      "severity": "LOW",
+      "title": "Rollback to gemini-legacy is not shown to work",
+      "detail": "The plan forbids legacy live calls. The legacy loop uses `GEMINI_MODEL` from the Claude Code config (value unknown) or the `gemini-2.5-flash` default. Nobody has checked that this path still works in October 2026, and `.env.local` has pointed at the (retired) openai provider since June. \"Rollback to gemini-legacy\" may therefore just swap one non-working state for another. The plan already admits that OpenAI isn't a reliable fallback, but it presents legacy as the documented response.",
+      "recommendation": "Describe rollback accurately. Restoring `.env.local` from the scratch backup returns to the previous state, which is non-working. `gemini-legacy` is an unverified fallback, not a known-good one."
+    },
+    {
+      "severity": "LOW",
+      "title": "\"Actual REST shape matches fixtures\" can't be observed under the logging policy",
+      "detail": "The harness sees only the MCP result. The plan also forbids dumping response objects. A successful run shows that the fields the code reads were present, but not that the full shape matches the fixtures. For example, it can't confirm the `store` field was accepted versus ignored, which status values were seen, or how the annotations are structured.",
+      "recommendation": "Either reword the acceptance criterion to \"consumed fields present and parsed\", or emit one allowlisted debug summary (status values seen, number of steps per type, annotation count by type, whether `errors[]` was present). The summary must contain no text or URLs."
+    },
+    {
+      "severity": "LOW",
+      "title": "Effect on a future Cloud Run redeploy is not flagged",
+      "detail": "Codex's client config points at a Cloud Run deployment of this server. If `RESEARCH_PROVIDER` isn't set there, the next redeploy of this code silently switches that remote endpoint to the paid Google agent. It also brings the logger change to stderr and the new error-envelope text. The plan rightly leaves deployment untouched, but the CHANGELOG entry as described doesn't call this out.",
+      "recommendation": "Add a line to the CHANGELOG or `.env.example` saying that remote deployments with `RESEARCH_PROVIDER` unset will switch to the paid agent on redeploy, so deployers should set the provider explicitly."
+    },
+    {
+      "severity": "LOW",
+      "title": "The repo's rule doc conflicts with the new progress notifications",
+      "detail": "`docs/rules/mcp-server-rules.md` says \"Progress notifications are not emitted\" and \"Avoid custom ad-hoc notifications\". The plan adds standard `notifications/progress`, sent only when the client supplies a `progressToken`. That fits the MCP spec, but the rule doc then becomes even more out of date. It is already outdated: it mentions `server.tool`, Firecrawl, and a `deep-research` tool name.",
+      "recommendation": "Optional: add a short note to the rule doc, or record in the CHANGELOG that standard progress notifications are now sent when a token is supplied. A full rewrite of the doc is out of scope."
+    }
+  ],
+  "required_changes": [
+    "Reconcile the authorization list with the verification steps. Either explicitly authorize the in-memory, digest-only same/different comparison of the `GEMINI_API_KEY` values in `.env.local` and `~/.claude.json`, or drop that step and record \"production key not compared\" as a gap. Also state that the \"First Claude Code run\" (a second paid run) is started by Herbert or needs his separate approval, and is never started by the implementing session.",
+    "Define the commit policy. Either make no commit in this session, or get Herbert's explicit permission to commit the June leftover work (including the untracked `src/ai/openai-deep-research.ts`, which the tracked `src/deep-research.ts` already imports) as a separate earlier commit, and only then commit this change. Never produce a commit that doesn't build or that silently includes the leftover work."
+  ],
+  "verification_gaps": [
+    "I ran no commands (no tests, tsc, git status or builds). The baseline (npm test 5 passed/2 failed, `tsc --noEmit` exits 0) is the plan's own claim, which I did not reproduce.",
+    "I did not read `~/.claude.json`, `~/tools/gemini-mcp-wrapper.js`, `.env.local` or `gemini_keys.json`. The launch path, the keys present, the current `RESEARCH_PROVIDER=openai` value, and whether `.env.local` sets anything else that matters (such as MCP_HTTP_MODE or LOG_PRETTY) all come from the plan.",
+    "Herbert's session authorizations (the paid live run, the `.env.local` edit, any commit) are asserted in the plan but recorded nowhere in the repo.",
+    "I checked that `openai-deep-research.ts` is untracked only by searching `.git/index` for the path string, not with git itself.",
+    "The Interactions API request/response shapes, whether `store`/`stream` are accepted, the status vocabulary, the cancel endpoint, agent ids, pricing and retention rest on the brief and can't be checked offline.",
+    "Claude Code's actual MCP tool timeout, whether it uses `progressToken`, and whether it sends `notifications/cancelled` are unknown. So is the implementing executor's per-command timeout.",
+    "I did not check whether the legacy Gemini path (the documented rollback) still works with the configured or default model."
+  ],
+  "confidence": "HIGH",
+  "cfrMeta": {
+    "phase": "plan",
+    "inputFile": ".plans/2026-10-29-gemini-deep-research-agent.md",
+    "inputInRepo": true,
+    "inputHash": "51da5adfb8f117f8df9ab2d63768ec8846de7ef5cd29c26ea913cf8c796d3aa0",
+    "reviewer": "fable",
+    "reviewerModel": "claude-opus-5-5",
+    "reviewDirection": "codex-authored/fable-reviewed",
+    "reviewedAt": "2026-10-29T17:55:40.000Z"
+  }
+}

@@ -56,3 +56,7 @@ TASKS.md
 .roo/rules/api.md
 docs/migration-plan-granular-2025-08-11.md
 .vscode/settings.json
+
+# Local secrets (never commit)
+gemini_keys.json
+.env.local
