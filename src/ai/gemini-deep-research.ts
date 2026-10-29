@@ -389,6 +389,12 @@ function categoryForFailedOutcome(outcome: RequestOutcome): GeminiDeepResearchEr
   }
 }
 
+/**
+ * Shape of an interaction id this client is willing to put into a URL path, a log line or a
+ * progress message. Anything else is a protocol violation, not an id to be encoded and retried.
+ */
+const INTERACTION_ID_PATTERN = /^[A-Za-z0-9_.-]{1,256}$/;
+
 const KNOWN_STATUSES = new Set([
   'in_progress',
   'requires_action',
@@ -574,8 +580,9 @@ export async function runGeminiDeepResearch(
     throw fail('protocol', 'Interaction create returned a response that is not a JSON object');
   }
   const created = createOutcome.body as InteractionResponse;
-  if (typeof created.id !== 'string' || created.id.length === 0) {
-    throw fail('protocol', 'Interaction create response is missing an id');
+  if (typeof created.id !== 'string' || !INTERACTION_ID_PATTERN.test(created.id)) {
+    // The id is deliberately not echoed: a malformed one is untrusted upstream data.
+    throw fail('protocol', 'Interaction create response is missing or has a malformed id');
   }
   if (typeof created.status !== 'string' || created.status.length === 0) {
     throw fail('protocol', 'Interaction create response is missing a status');
@@ -583,7 +590,8 @@ export async function runGeminiDeepResearch(
   const interactionId = created.id;
   logger.info({ op: 'create', interactionId, interactionStatus: KNOWN_STATUSES.has(created.status) ? created.status : 'unknown' }, 'Interaction created');
   summarizeResponse(summary, created);
-  reportProgress(created.status);
+  // Only a recognised status reaches the client's progress channel; unknown ones are sanitised.
+  reportProgress(KNOWN_STATUSES.has(created.status) ? created.status : 'unknown');
 
   // ---- poll ---------------------------------------------------------------
   let current: InteractionResponse = created;

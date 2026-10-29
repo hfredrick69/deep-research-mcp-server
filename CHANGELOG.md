@@ -50,6 +50,23 @@ All notable changes to the Deep Research MCP Server are documented in this file.
   leaves `RESEARCH_PROVIDER` unset will switch from OpenAI to the paid Google agent on its
   next redeploy. Set the provider explicitly in every deployed environment.
 
+### Fixed
+
+- **Report write failures no longer discard the finished report.** All three providers (Gemini
+  agent, `gemini-legacy`, `openai`) now return the complete report in `content` with a
+  `persistWarning` (intended path and OS error code only) and no `reportPath` when the file
+  cannot be written. The Gemini runner previously threw `persist_failed` and the other two
+  surfaced the raw filesystem error, losing a paid run's text either way.
+- **Report files are created exclusively** (`flag: 'wx'`): an existing file at the timestamped
+  path is never overwritten; the collision is reported as a `persistWarning` instead.
+- **Gemini Interactions client validates the create response before reporting progress.** An
+  interaction id outside `[A-Za-z0-9_.-]{1,256}` is a `protocol` error (not echoed, not polled,
+  not cancelled); an unrecognised initial status reaches progress listeners as `unknown`
+  instead of verbatim upstream text.
+- `resolveReportDirectory(env, launchCwd)` is exported from the runner as the shared
+  output-directory contract. It returns the resolved launch cwd; a configurable `REPORT_DIR`
+  is deliberately deferred.
+
 ## [0.5.0] - 2026-06-12
 
 ### Changed

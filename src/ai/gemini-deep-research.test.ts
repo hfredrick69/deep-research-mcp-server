@@ -303,7 +303,7 @@ test('run: immediate completion on POST returns report, citations and learning',
 });
 
 test('run: polls the same encoded id at the poll interval and reports progress each time', async () => {
-  const id = 'int/with spaces';
+  const id = 'int_7.abc-XYZ';
   const h = new Harness([
     () => json(inProgress(id)),
     () => json(inProgress(id)),
@@ -482,6 +482,38 @@ test('run: missing id, missing status or non-JSON body on create is a protocol e
     assert.equal(h.cancels().length, 0);
     assert.equal(h.creates().length, 1);
   }
+});
+
+test('run: a malformed interaction id on create is a protocol error with no poll and no cancel', async () => {
+  const ids = ['int/with spaces', 'a'.repeat(257), 'id;rm -rf', '../x', 'int\n-1', 'ünïcödé'];
+  for (const id of ids) {
+    const h = new Harness([() => json({ id, status: 'in_progress' })]);
+    const err = await expectError(runGeminiDeepResearch({ query: 'q' }, h.deps()));
+    assert.equal(err.category, 'protocol', `id ${JSON.stringify(id)} should be rejected`);
+    assert.ok(!err.message.includes(id), 'the malformed id is not echoed into the error message');
+    assert.equal(h.calls.length, 1, 'no poll and no cancel after a rejected id');
+    assert.equal(h.cancels().length, 0);
+  }
+});
+
+test('run: a 256-character well-formed id is accepted', async () => {
+  const id = 'x'.repeat(256);
+  const h = new Harness([() => json(completed(id))]);
+  const result = await runGeminiDeepResearch({ query: 'q' }, h.deps());
+  assert.equal(result.content, '# Report\n\nBody.');
+  assert.equal(h.creates().length, 1);
+});
+
+test('run: an unknown create status is reported to progress as "unknown", never verbatim', async () => {
+  const h = new Harness([() => json({ id: 'int-4', status: 'weird' }), () => json({})]);
+  const progress: string[] = [];
+  const err = await expectError(
+    runGeminiDeepResearch({ query: 'q', onProgress: (status) => progress.push(status) }, h.deps()),
+  );
+  assert.equal(err.category, 'protocol');
+  assert.ok(progress.includes('unknown'), 'the sanitised placeholder reaches progress');
+  assert.ok(!progress.includes('weird'), 'the raw upstream status never reaches progress');
+  assert.equal(h.cancels().length, 1);
 });
 
 test('run: GET returning a different id is a protocol error and cancels the original id', async () => {
