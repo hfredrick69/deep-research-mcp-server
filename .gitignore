@@ -60,3 +60,6 @@ docs/migration-plan-granular-2025-08-11.md
 # Local secrets (never commit)
 gemini_keys.json
 .env.local
+
+# Local security-gate approval token (per-commit state, never commit)
+.security-review/
