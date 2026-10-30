@@ -78,7 +78,8 @@ These rules align `src/mcp-server.ts` with @modelcontextprotocol/sdk best practi
   );
   ```
   - Some SDK versions expose `server.registerTool(...)`. Use whichever matches your installed version; current code uses `server.tool(...)`.
-  - For large outputs, consider returning `resource_link` items pointing to saved reports/resources instead of huge text blobs.
+  - `createServer(deps)` in `src/server.ts` owns the factory and registers `deepResearch.run`; `src/mcp-server.ts` only loads `.env.local` and connects the transport. Add tools in `server.ts`, not the entry point.
+  - For large outputs the stdio transport returns a compact text envelope (absolute report path, byte size, counts, excerpt) once the response exceeds `MCP_STDIO_INLINE_MAX_BYTES` (default 32768). `resource_link` items are deferred: client support for them is uneven as of SDK 1.17.2 and the file path already lets the client read the report. Revisit when the SDK and the target clients both support them.
 
 ## Resources (optional, recommended)
 - Expose read-only artifacts as **resources** to avoid large payloads and allow lazy fetch by clients:
@@ -94,13 +95,14 @@ These rules align `src/mcp-server.ts` with @modelcontextprotocol/sdk best practi
   ```
 
 ## Notifications & Dynamics
-- **Avoid manual internal access** like `server.server...`; use SDK APIs only.
+- Prefer the high-level `McpServer` API. Reaching the underlying `Server` through `server.server` is acceptable only for documented public SDK APIs that `McpServer` does not wrap; today that is `setRequestHandler(SetLevelRequestSchema, ...)` for `logging/setLevel` and `sendLoggingMessage` for `notifications/message`. Both are SDK 1.17.2-specific; re-check when the SDK is upgraded.
 - Prefer dynamic enable/disable/update of tools/resources to automatically emit `list_changed` notifications.
 - Enable **debounced notifications** in the constructor to coalesce rapid changes.
-- For progress updates:
-  - Keep progress logging server-side (`stderr`).
-  - If a client needs live progress, prefer exposing a status resource (e.g., `status://{taskId}`) that clients can poll. Avoid custom ad-hoc notifications unless you control both ends.
-  - Update (2026-10-29): `deepResearch.run` emits standard MCP `notifications/progress` when the request carries a `progressToken` (`_meta.progressToken`); without one, progress stays in the server log. See `src/server.ts`.
+- For progress updates (`deepResearch.run`, see `createProgressReporter` in `src/server.ts`):
+  - Clients that send `_meta.progressToken` get standard `notifications/progress` on both transports.
+  - Stdio clients without a token get `notifications/message` (`level: info`, `logger: deep-research`, data `{ requestId, stage, elapsedMs, message }`): `starting` at once, a heartbeat every 30 s, one terminal message. The stdio server advertises `{ logging: {} }` and filters by the level set through `logging/setLevel`. HTTP clients without a token get nothing.
+  - One send in flight at a time, no queue; a rejected send disables further forwarding for that request. Messages are server-authored only; never forward the query, upstream text or URLs.
+  - Keep detailed progress in the `stderr` log as well; notifications are best effort.
 
 ## Error Handling
 - Catch errors and return a clear text message in `content`. Example:
@@ -138,7 +140,7 @@ These rules align `src/mcp-server.ts` with @modelcontextprotocol/sdk best practi
 ## Notes
 - Current orchestrator still uses Firecrawl; Exa integration is planned but not yet wired. Keep docs and code consistent until migration is complete.
 - Environment loaded from `.env.local` in `mcp-server.ts`; do not log secrets.
-- Progress notifications are not emitted; only stderr logging is used.
+- Progress is forwarded to clients as described under Notifications & Dynamics, and always logged to stderr.
 
 ## Logs
 - `src/mcp-server.ts`: `log(...args)` writes to stderr. Connection and errors are logged around `server.connect(...)`.

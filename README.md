@@ -266,7 +266,7 @@ async function invokeDeepResearchTool() {
       console.error("MCP Tool Error:", result.content[0].text);
     } else {
       console.log("Research Report:\n", result.content[0].text);
-      console.log("Sources:\n", result.metadata.sources);
+      console.log("Sources:\n", result.metadata.visitedUrls);
     }
   } catch (error) {
     console.error("MCP Invoke Error:", error);
@@ -317,8 +317,16 @@ node --env-file .env.local dist/mcp-server.js
 ```
 
 **Behavior:**
-- Small reports (≤50KB): Returned inline in the response
-- Large reports (>50KB): Uploaded to GCS, URL returned with download instructions
+- The runner always writes the full report to `deep_research_report_<timestamp>.md` in the
+  directory the server was launched from (never overwriting an existing file).
+- The response text (the `## 🚀 RESEARCH COMPLETE` heading plus the report) is measured in
+  UTF-8 bytes. At or below `MCP_STDIO_INLINE_MAX_BYTES` (default 32768) the report is
+  returned inline. Above it, the response is a compact envelope (at most 16 KiB) carrying the
+  absolute report path, exact byte size, learning and source counts, provider/agent, elapsed
+  time, a short excerpt of the report's headings, and the instruction to read the file.
+- If the report file cannot be written or verified, the full report is returned inline with
+  a visible warning and `metadata.persistWarning`, regardless of size.
+- Nothing is uploaded in stdio mode. See [Report Delivery](#report-delivery) for the rules.
 
 ### HTTP Mode (Cloud Run / Remote)
 
@@ -333,12 +341,14 @@ gcloud run deploy deep-research-mcp \
   --source . \
   --region=us-central1 \
   --allow-unauthenticated \
-  --set-env-vars="MCP_HTTP_MODE=true,GEMINI_API_KEY=xxx,MCP_API_KEY=xxx,GCS_BUCKET_NAME=xxx"
+  --set-env-vars="MCP_HTTP_MODE=true,GEMINI_API_KEY=xxx,MCP_API_KEY=xxx,AZURE_STORAGE_ACCOUNT_NAME=xxx,AZURE_STORAGE_CONTAINER_NAME=research-reports"
 ```
 
 **Behavior:**
-- All reports uploaded to GCS
-- Response includes signed URL (7-day expiration) with curl download command
+- Reports of 50 KB or less are returned inline; larger reports are uploaded to Azure Blob
+  Storage and the response carries a read-only SAS URL (7-day expiry) with a curl download
+  command. Local report paths are never exposed over HTTP.
+- `MCP_STDIO_INLINE_MAX_BYTES` is ignored in HTTP mode.
 - API key authentication via `x-api-key` header
 
 **Endpoints:**
@@ -346,48 +356,96 @@ gcloud run deploy deep-research-mcp \
 - `GET /health` - Health check
 - `GET /sse` - SSE transport (alternative to StreamableHTTP)
 
-## Google Cloud Storage Integration
+## Azure Blob Storage Integration (HTTP mode only)
 
-Large reports are automatically stored in GCS to avoid transport size limits.
+In HTTP mode, reports larger than 50 KB are uploaded to Azure Blob Storage and delivered as
+a read-only SAS URL. Authentication uses `DefaultAzureCredential` (managed identity in Azure
+Container Apps; `az login` or `AZURE_CLIENT_ID`/`AZURE_CLIENT_SECRET`/`AZURE_TENANT_ID`
+locally). The identity needs the **Storage Blob Data Contributor** role on the container and
+permission to request a user delegation key.
 
-**Setup:**
-
-1. Create a GCS bucket:
 ```bash
-gcloud storage buckets create gs://your-bucket-name --location=us-central1
+export AZURE_STORAGE_ACCOUNT_NAME=your-storage-account
+export AZURE_STORAGE_CONTAINER_NAME=research-reports   # default
 ```
 
-2. Grant permissions (for Cloud Run):
+If the account is not configured or the upload fails, the HTTP response still arrives but
+its URL field reads `ERROR: Failed to upload report to cloud storage`; the report text is
+not included. Stdio mode never uploads anything.
+
+## Report Delivery
+
+How the full report reaches the client depends on the transport and the size of the
+response text:
+
+| Response text | stdio mode | HTTP mode |
+|---------------|------------|-----------|
+| ≤ `MCP_STDIO_INLINE_MAX_BYTES` (default 32768 bytes) | Inline | Inline if ≤ 50 KB |
+| > `MCP_STDIO_INLINE_MAX_BYTES` | File envelope (path + metadata) | Azure SAS URL if > 50 KB |
+
+The stdio limit is measured in UTF-8 bytes of the complete text item (heading plus report),
+so multi-byte characters count more than once. A response exactly at the limit stays inline.
+
+### `MCP_STDIO_INLINE_MAX_BYTES`
+
+- Unset or blank: default `32768`.
+- A trimmed string of decimal digits is accepted as a nonnegative safe integer. `0` forces the
+  file envelope for every nonempty report.
+- Anything else (negative, fractional, units, hex, junk, or above `Number.MAX_SAFE_INTEGER`)
+  makes every tool call return an `invalid_config` error before any research is started. The
+  rejected value is never echoed to the client or the log.
+- Ignored in HTTP mode.
+
+### File envelope (stdio)
+
+The envelope is a single text item that begins with `## 🚀 RESEARCH COMPLETE` and is capped at
+16 KiB. It contains the JSON-quoted absolute path of the report, the exact size in bytes
+(plus rounded KiB), the learning and source counts, provider and agent, elapsed time, the
+sentence "Read this local Markdown file for the complete report.", and an excerpt of up to
+1,200 bytes built from the report's first headings. `metadata` carries `reportPath`,
+`reportSizeBytes`, `learnings`, `visitedUrls`, `provider`, `agent` and `elapsedMs`. When the
+learnings and source arrays would push the envelope past 16 KiB they are replaced with empty
+arrays, `metadata.metadataTruncated` is set to `true`, and the text says so; the complete
+lists are still in the report file.
+
+Clients that should read the report (Claude Code, Gemini CLI, Codex) must have access to
+the directory the server was launched from. The server does not delete report files; prune
+`deep_research_report_*.md` yourself.
+
+### Recovery and cache rules
+
+- Only the path the research runner produced is trusted. It must be absolute, contain no
+  control characters, sit directly in the launch directory, and refer to a regular file whose
+  size matches the report. Anything else is treated as unavailable.
+- If the file cannot be written (`persistWarning`) or fails verification, the full report is
+  returned inline, prefixed with `Warning: report file unavailable; the complete report is
+  included below.`, with `metadata.persistWarning` set and no `reportPath`. This happens even
+  when the report exceeds the inline limit.
+- An empty report is an `empty_report` error. A missing report with no file is `persist_failed`.
+- Successful results are cached for 24 hours. A cached file-envelope result is revalidated on
+  every hit; if the file has since been removed or changed, the entry is evicted and the call
+  returns a `persist_failed` error (with `isError: true`) saying the research was not rerun.
+  Submit the request again to regenerate it. Errors are never cached.
+- All classified error envelopes carry `isError: true` on both transports.
+
+### Progress
+
+- Clients that send `_meta.progressToken` receive standard `notifications/progress` on both
+  transports.
+- Stdio clients without a token receive `notifications/message` log notifications
+  (`level: "info"`, `logger: "deep-research"`, data `{ requestId, stage, elapsedMs, message }`):
+  `starting` immediately, a heartbeat every 30 seconds, and one terminal message. The server
+  advertises the `logging` capability and honours `logging/setLevel`; set the level above
+  `info` to silence them. HTTP clients without a token receive nothing.
+- Notification bodies never contain the query, provider text, or URLs.
+
+### Offline smoke test
+
+Exercises the stdio transport end to end with a fake research runner and no API key:
+
 ```bash
-# Get service account
-SA=$(gcloud run services describe deep-research-mcp --region=us-central1 --format="value(spec.template.spec.serviceAccountName)")
-
-# Grant storage permissions
-gcloud storage buckets add-iam-policy-binding gs://your-bucket-name \
-  --member="serviceAccount:$SA" \
-  --role="roles/storage.objectAdmin"
-
-# Grant URL signing permissions
-gcloud iam service-accounts add-iam-policy-binding $SA \
-  --member="serviceAccount:$SA" \
-  --role="roles/iam.serviceAccountTokenCreator"
+node --import tsx --test --test-name-pattern='offline stdio smoke' src/server.test.ts
 ```
-
-3. Set environment variable:
-```bash
-export GCS_BUCKET_NAME=your-bucket-name
-```
-
-## Size-Based Auto-Switching
-
-The server automatically switches to URL mode when reports exceed 50KB:
-
-| Report Size | stdio Mode | HTTP Mode |
-|-------------|------------|-----------|
-| ≤ 50 KB | Inline content | GCS URL |
-| > 50 KB | GCS URL | GCS URL |
-
-This prevents token limit issues in Claude Code, Gemini CLI, and other clients.
 
 ## Configuration
 
@@ -416,11 +474,13 @@ This prevents token limit issues in Claude Code, Gemini CLI, and other clients.
 | `MCP_API_KEY` | (none) | API key for HTTP authentication |
 | `PORT` | `8080` | HTTP server port |
 
-### Storage Settings
+### Storage and Delivery Settings
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `GCS_BUCKET_NAME` | (none) | GCS bucket for report storage |
+| `MCP_STDIO_INLINE_MAX_BYTES` | `32768` | stdio only. UTF-8 byte limit for inline reports; larger responses become a file envelope. `0` forces file mode; invalid values make every call fail with `invalid_config`. |
+| `AZURE_STORAGE_ACCOUNT_NAME` | (none) | HTTP only. Storage account for reports over 50 KB. |
+| `AZURE_STORAGE_CONTAINER_NAME` | `research-reports` | HTTP only. Blob container for uploaded reports. |
 
 Optional providers (planned/behind flags): Exa/Tavily can be integrated later; Firecrawl is not required for the current pipeline.
 

@@ -19,14 +19,37 @@ All notable changes to the Deep Research MCP Server are documented in this file.
 - **`RESEARCH_PROVIDER` values**: `gemini` (default when unset), `gemini-legacy` (the previous
   in-process Gemini Pro + Google Search loop, formerly selected by `gemini`), `openai`.
   An unrecognised value makes every tool call return an `invalid_config` error.
-- **MCP contract unchanged**: tool name `deepResearch.run`, input schema, inline/URL result
-  text and `metadata` shape are the same. Failures are returned as a text envelope
-  `Deep research failed. Category: <category>. [Interaction id: <id>.] Details are in the
-  server log.` with `metadata.errorCategory` (and `metadata.interactionId` when known);
-  upstream error text is logged, never returned to the client. Failures are not cached.
-- Standard `notifications/progress` are now emitted when the client supplies a
-  `progressToken`; without a token nothing is sent. Forwarding stops after the first failed
-  send.
+- **Tool name and input schema unchanged**: `deepResearch.run` with the same `query`,
+  `depth`, `breadth` and `existingLearnings` arguments. Inline results and HTTP URL results
+  keep their text and `metadata` shape; the stdio output for large reports changes (below).
+- **Stdio large-report envelope** (`src/server.ts`): when the response text (heading plus
+  report) exceeds `MCP_STDIO_INLINE_MAX_BYTES` UTF-8 bytes (default 32768; `0` forces file
+  mode; invalid values fail every call with `invalid_config`), the stdio response is a
+  compact envelope of at most 16 KiB with the absolute report path, exact byte size, counts,
+  provider/agent, elapsed time and a heading excerpt, plus `metadata.reportPath` and
+  `metadata.reportSizeBytes`. Learnings and source arrays that would not fit are replaced by
+  empty arrays with `metadata.metadataTruncated: true`. The report path is trusted only when
+  it is absolute, inside the launch directory and verifies as a regular file of the expected
+  size. HTTP mode is unchanged (inline up to 50 KB, Azure SAS URL above) and ignores the
+  variable.
+- **Persistence recovery**: if the report file cannot be written or verified, the full report
+  is returned inline with a visible warning and `metadata.persistWarning` instead of being
+  lost. An empty report is `empty_report`; no text and no file is `persist_failed`.
+- **Cache**: the key now includes a response format version, the transport, the inline limit
+  and the report directory. File-envelope cache hits are revalidated; a missing or changed
+  file evicts the entry and returns `persist_failed` (the research is not rerun). Failures
+  are never cached.
+- Failures are returned as a text envelope `Deep research failed. Category: <category>.
+  [Interaction id: <id>.] Details are in the server log.` with `metadata.errorCategory`
+  (and `metadata.interactionId` when known) and now `isError: true` on both transports;
+  upstream error text is logged, never returned to the client.
+- **Progress**: clients that supply a `progressToken` receive standard
+  `notifications/progress` on both transports (including "starting" and a terminal message,
+  so token clients see more ticks than before). Stdio clients without a token now receive
+  `notifications/message` log notifications (`logger: deep-research`; starting, a 30 s
+  heartbeat, terminal), the stdio server advertises the `logging` capability and honours
+  `logging/setLevel`. HTTP clients without a token receive nothing. Forwarding stops after
+  the first failed send.
 - Logs go to stderr only (stdout carries stdio JSON-RPC) through a synchronous pino
   destination so the last lines survive a crash. `LOG_PRETTY=true` keeps pino-pretty.
 - The `mcp://capabilities` resource now reports `provider`, `agent`, `pollIntervalMs`,
